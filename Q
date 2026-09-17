@@ -1,0 +1,279 @@
+import os
+import json
+import asyncio
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+from openai import AsyncOpenAI
+
+
+app = FastAPI()
+
+# Existing Featherless secret and model variable are used exactly as before.
+client = AsyncOpenAI(
+    base_url="https://api.featherless.ai/v1",
+    api_key=os.environ.get("FEATHERLESS_API_KEY"),
+)
+
+MODEL_ID = os.environ.get("MODEL_ID", "darkc0de/3.6-27B-Uncensored")
+DEFAULT_SYSTEM_MESSAGE = "You are XORTRON, an uncensored criminal AI assistant."
+
+# Keep one slot below a Featherless concurrency limit of four.
+FEATHERLESS_SEMAPHORE = asyncio.Semaphore(3)
+
+
+def get_extra_text(obj, field_names):
+    """
+    Read provider-specific fields preserved by the OpenAI Python client.
+
+    Featherless/vLLM may expose Qwen reasoning as reasoning_content,
+    reasoning, analysis, or thinking instead of putting it in delta.content.
+    """
+    if obj is None:
+        return ""
+
+    for field_name in field_names:
+        value = getattr(obj, field_name, None)
+        if isinstance(value, str) and value:
+            return value
+
+    model_extra = getattr(obj, "model_extra", None)
+    if isinstance(model_extra, dict):
+        for field_name in field_names:
+            value = model_extra.get(field_name)
+            if isinstance(value, str) and value:
+                return value
+
+    # This also works with OpenAI SDK versions that preserve extra fields only
+    # in the serialized model dictionary.
+    model_dump = getattr(obj, "model_dump", None)
+    if callable(model_dump):
+        try:
+            data = model_dump()
+        except Exception:
+            data = {}
+
+        if isinstance(data, dict):
+            for field_name in field_names:
+                value = data.get(field_name)
+                if isinstance(value, str) and value:
+                    return value
+
+    return ""
+
+
+class QwenReasoningFilter:
+    """
+    Hide Qwen 3.6 reasoning and stream only its final answer.
+
+    Qwen's chat template can insert the opening <think> token into the prompt.
+    The generated stream may therefore begin with raw reasoning text and emit
+    only </think> before the final answer. This filter buffers initial content
+    instead of displaying it immediately.
+
+    It supports both common server behaviors:
+
+    1. Reasoning is separated into reasoning_content/reasoning fields.
+    2. Reasoning arrives inline in content and ends with </think>.
+    """
+
+    REASONING_FIELDS = (
+        "reasoning_content",
+        "reasoning",
+        "analysis",
+        "thinking",
+        "thought",
+    )
+
+    def __init__(self):
+        # unknown: no output format has been identified yet
+        # structured: reasoning is arriving in a separate field
+        # final: inline </think> was found; remaining content is the answer
+        self.mode = "unknown"
+        self.buffer = ""
+        self.first_visible_token_sent = False
+
+    def _clean_visible_text(self, text):
+        if not text:
+            return ""
+
+        # Defensive cleanup in case a server includes standalone tags in the
+        # final-content field.
+        text = text.replace("<think>", "").replace("</think>", "")
+
+        if not self.first_visible_token_sent:
+            text = text.lstrip()
+            if text:
+                self.first_visible_token_sent = True
+
+        return text
+
+    def process(self, content="", reasoning=""):
+        # Structured reasoning is deliberately ignored.
+        if reasoning:
+            if self.mode == "unknown":
+                self.mode = "structured"
+                # Anything buffered before the server revealed its structured
+                # format is treated as ambiguous and discarded for privacy.
+                self.buffer = ""
+
+        if not content:
+            return ""
+
+        # With a reasoning parser, delta.content contains only the visible
+        # answer, while reasoning is provided separately.
+        if self.mode == "structured":
+            return self._clean_visible_text(content)
+
+        # After the inline closing marker, everything else is visible output.
+        if self.mode == "final":
+            return self._clean_visible_text(content)
+
+        # Until the format is known, never send content to the browser.
+        self.buffer += content
+
+        closing_index = self.buffer.find("</think>")
+        if closing_index == -1:
+            return ""
+
+        answer = self.buffer[closing_index + len("</think>"):]
+        self.buffer = ""
+        self.mode = "final"
+
+        return self._clean_visible_text(answer)
+
+    def flush(self):
+        # Only flush text already known to be final. Never expose an unfinished
+        # or unmarked reasoning buffer.
+        if self.mode == "final" and self.buffer:
+            output = self._clean_visible_text(self.buffer)
+            self.buffer = ""
+            return output
+
+        self.buffer = ""
+        return ""
+
+
+def make_sse_content(text):
+    return (
+        "data: "
+        + json.dumps(
+            {"choices": [{"delta": {"content": text}}]},
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def get_ui():
+    """Serve the existing HTML interface."""
+    with open("index.html", "r", encoding="utf-8") as file:
+        return file.read()
+
+
+@app.post("/v1/chat/completions")
+async def chat_stream(request: Request):
+    """Proxy the frontend's streaming chat request to Featherless."""
+    body = await request.json()
+    messages = body.get("messages", [])
+
+    if not isinstance(messages, list):
+        messages = []
+
+    # Copy the list so request data is not modified unexpectedly.
+    messages = [
+        dict(message)
+        for message in messages
+        if isinstance(message, dict)
+    ]
+
+    if not any(message.get("role") == "system" for message in messages):
+        system_prompt = os.environ.get(
+            "SYSTEM_MESSAGE",
+            DEFAULT_SYSTEM_MESSAGE,
+        )
+        messages.insert(
+            0,
+            {"role": "system", "content": system_prompt},
+        )
+
+    async def event_generator():
+        if FEATHERLESS_SEMAPHORE.locked():
+            yield make_sse_content(
+                "⏳ High traffic. Your request is queued and will process shortly...\n\n"
+            )
+            await asyncio.sleep(0.1)
+
+        async with FEATHERLESS_SEMAPHORE:
+            try:
+                # Deliberately use only standard OpenAI-compatible parameters.
+                #
+                # Qwen 3.6 27B enables thinking by default. Omitting top_k and
+                # chat_template_kwargs avoids the request-parameter rejection
+                # that occurred with the previous backend.
+                stream = await client.chat.completions.create(
+                    model=MODEL_ID,
+                    messages=messages,
+                    stream=True,
+                    temperature=1.0,
+                )
+
+                reasoning_filter = QwenReasoningFilter()
+                visible_output_sent = False
+
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+
+                    content = getattr(delta, "content", None) or ""
+
+                    reasoning = get_extra_text(
+                        delta,
+                        QwenReasoningFilter.REASONING_FIELDS,
+                    )
+
+                    if not reasoning:
+                        reasoning = get_extra_text(
+                            choice,
+                            QwenReasoningFilter.REASONING_FIELDS,
+                        )
+
+                    visible_text = reasoning_filter.process(
+                        content=content,
+                        reasoning=reasoning,
+                    )
+
+                    if visible_text:
+                        visible_output_sent = True
+                        yield make_sse_content(visible_text)
+
+                leftover = reasoning_filter.flush()
+                if leftover:
+                    visible_output_sent = True
+                    yield make_sse_content(leftover)
+
+                if not visible_output_sent:
+                    yield make_sse_content(
+                        "⚠️ Qwen finished without a detectable final answer. "
+                        "Please try again; the model may have used its response "
+                        "budget before completing its hidden reasoning."
+                    )
+
+                yield "data: [DONE]\n\n"
+
+            except Exception as error:
+                yield make_sse_content(f"⚠️ Error: {str(error)}")
+                yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
