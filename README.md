@@ -1,5 +1,5 @@
 ---
-title: UncensoredChat
+title: XORTRON
 emoji: 💻
 colorFrom: indigo
 colorTo: pink
