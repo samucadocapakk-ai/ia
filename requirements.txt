@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+openai
+httpx>=0.27,<1
+tzdata
